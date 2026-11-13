@@ -54,10 +54,6 @@ returns.
 The model keeps a fixed scale while rotating. Press `+` (or `=`) to zoom in and
 `-` to zoom out; zooming in is deliberately allowed to crop the model.
 
-Interactive rotation includes a short original lightsaber-style swing (a
-harmonic hum with Doppler pitch shift and a sweeping resonance) on each turn. Use `--mute` to disable it. On macOS
-it uses the system audio player; on Linux it uses `aplay` when available.
-
 It accepts both binary and ASCII STL. The preview stays in the terminal so it
 can actually be viewed; it naturally scrolls away with terminal output. Use
 `--delete-after` only for protocol testing, since it removes the preview before

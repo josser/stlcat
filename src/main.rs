@@ -1,9 +1,6 @@
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
-use std::process::Command;
-use std::sync::mpsc::{self, SyncSender};
-use std::thread::JoinHandle;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
@@ -45,10 +42,6 @@ struct Args {
     /// Rotate the model manually with arrow keys; press q or Escape to finish
     #[arg(long)]
     interactive: bool,
-
-    /// Disable synthesized rotation sound effects in interactive mode
-    #[arg(long)]
-    mute: bool,
 
     /// Number of rotation frames (only used with --rotate)
     #[arg(long, default_value_t = 36)]
@@ -419,152 +412,6 @@ fn move_cursor_home() -> io::Result<()> {
     out.flush()
 }
 
-/// A tiny original synthesized lightsaber-style swing. It is played by the
-/// platform's normal WAV player so the viewer has no audio-library dependency.
-struct SoundEffects {
-    sender: Option<SyncSender<()>>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl SoundEffects {
-    fn new(enabled: bool) -> Self {
-        if !enabled {
-            return Self {
-                sender: None,
-                worker: None,
-            };
-        }
-        let path = std::env::temp_dir().join(format!("stlcat-sweep-{}.wav", std::process::id()));
-        if write_swoosh_wav(&path).is_err() {
-            return Self {
-                sender: None,
-                worker: None,
-            };
-        }
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            while receiver.recv().is_ok() {
-                let _ = audio_player(&path).status();
-            }
-            let _ = fs::remove_file(path);
-        });
-        Self {
-            sender: Some(sender),
-            worker: Some(worker),
-        }
-    }
-
-    fn play(&self) {
-        if let Some(sender) = &self.sender {
-            // One queued effect is enough; rapid turns should not leave a
-            // backlog of sounds playing after the user has stopped.
-            let _ = sender.try_send(());
-        }
-    }
-}
-
-impl Drop for SoundEffects {
-    fn drop(&mut self) {
-        self.sender.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn audio_player(path: &std::path::Path) -> Command {
-    let mut command = Command::new("afplay");
-    command.arg(path);
-    command
-}
-
-#[cfg(target_os = "linux")]
-fn audio_player(path: &std::path::Path) -> Command {
-    let mut command = Command::new("aplay");
-    command.arg("-q").arg(path);
-    command
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn audio_player(_path: &std::path::Path) -> Command {
-    Command::new("false")
-}
-
-fn write_swoosh_wav(path: &std::path::Path) -> io::Result<()> {
-    const RATE: u32 = 44_100;
-    const SAMPLES: usize = 24_000; // ~540 ms
-    const HARMONICS: usize = 28;
-    const BASE_HZ: f32 = 104.0;
-    // Lightsaber-style swing: a buzzy, harmonically rich hum (two slightly
-    // detuned voices beat against each other), Doppler-shifted as the blade
-    // passes, with a moving resonance that gives the "wwwOOOwm" vowel sweep.
-    let mut pcm = Vec::with_capacity(SAMPLES * 4);
-    let mut phase = [0.0f32; 2];
-    let mut flutter_phase = 0.0f32;
-    let mut lowpass = [0.0f32; 2];
-    for index in 0..SAMPLES {
-        let p = index as f32 / SAMPLES as f32;
-        // Doppler: pitch climbs while approaching, then drops quickly after.
-        let approach = (std::f32::consts::PI * p.powf(0.65)).sin().max(0.0);
-        let pitch = 0.82 + 0.78 * approach * (1.0 - 0.25 * p);
-        // Resonance sweeps up through the harmonics and back down.
-        let formant = 3.0 + 13.0 * approach;
-        // Loudest at the pass-by, with a quiet hum bed under it.
-        let envelope = (0.22 + 0.78 * approach.powf(1.4))
-            * (p / 0.02).min(1.0)
-            * ((1.0 - p) / 0.22).min(1.0);
-        flutter_phase += std::f32::consts::TAU * 118.0 / RATE as f32;
-        let flutter = 1.0 + 0.12 * flutter_phase.sin();
-        let mut frame = [0.0f32; 2];
-        for (voice, detune) in [0.9955f32, 1.0045].into_iter().enumerate() {
-            let frequency = BASE_HZ * pitch * detune;
-            phase[voice] += std::f32::consts::TAU * frequency / RATE as f32;
-            if phase[voice] > std::f32::consts::TAU {
-                phase[voice] -= std::f32::consts::TAU;
-            }
-            let mut sum = 0.0f32;
-            for n in 1..=HARMONICS {
-                let nf = n as f32;
-                if frequency * nf > 9_000.0 {
-                    break;
-                }
-                let tilt = 1.0 / nf.powf(0.75);
-                let peak = (-((nf - formant) / 3.2).powi(2)).exp();
-                sum += (phase[voice] * nf).sin() * tilt * (0.35 + 1.6 * peak);
-            }
-            // Gentle low-pass keeps the buzz from getting harsh.
-            lowpass[voice] += 0.45 * (sum - lowpass[voice]);
-            frame[voice] = lowpass[voice];
-        }
-        // Voices sit in opposite ears and bleed a little together; the pan
-        // drifts across the swing so the blade seems to move past.
-        let pan = 0.5 + 0.35 * (p * std::f32::consts::PI).cos();
-        let mid = (frame[0] + frame[1]) * 0.5;
-        let left = (mid + (frame[0] - frame[1]) * 0.5) * (1.1 - pan * 0.7);
-        let right = (mid - (frame[0] - frame[1]) * 0.5) * (0.4 + pan * 0.7);
-        for channel in [left, right] {
-            let value = (channel * flutter * envelope * 0.34).tanh() * 0.8;
-            pcm.extend_from_slice(&((value * i16::MAX as f32) as i16).to_le_bytes());
-        }
-    }
-    let data_len = pcm.len() as u32;
-    let mut file = File::create(path)?;
-    file.write_all(b"RIFF")?;
-    file.write_all(&(36 + data_len).to_le_bytes())?;
-    file.write_all(b"WAVEfmt ")?;
-    file.write_all(&16u32.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&2u16.to_le_bytes())?;
-    file.write_all(&RATE.to_le_bytes())?;
-    file.write_all(&(RATE * 4).to_le_bytes())?;
-    file.write_all(&4u16.to_le_bytes())?;
-    file.write_all(&16u16.to_le_bytes())?;
-    file.write_all(b"data")?;
-    file.write_all(&data_len.to_le_bytes())?;
-    file.write_all(&pcm)
-}
-
 fn interactive_kitty(
     tris: &[Triangle],
     view: ModelView,
@@ -572,7 +419,6 @@ fn interactive_kitty(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _raw_mode = RawMode::enable()?;
     let _saved_cursor = SavedCursor::save_and_move_home()?;
-    let sound_effects = SoundEffects::new(!args.mute);
     let step = 10f32.to_radians();
     let mut orientation = identity();
     let mut zoom = 1.0;
@@ -626,7 +472,6 @@ fn interactive_kitty(
                     }
                     _ => continue,
                 }
-                sound_effects.play();
                 image_id = image_id.checked_add(1).ok_or("too many rotations")?;
                 break;
             }
