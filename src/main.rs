@@ -419,7 +419,7 @@ fn move_cursor_home() -> io::Result<()> {
     out.flush()
 }
 
-/// A tiny original synthesized plasma-like pass-by. It is played by the
+/// A tiny original synthesized lightsaber-style swing. It is played by the
 /// platform's normal WAV player so the viewer has no audio-library dependency.
 struct SoundEffects {
     sender: Option<SyncSender<()>>,
@@ -493,36 +493,60 @@ fn audio_player(_path: &std::path::Path) -> Command {
 
 fn write_swoosh_wav(path: &std::path::Path) -> io::Result<()> {
     const RATE: u32 = 44_100;
-    const SAMPLES: usize = 12_348; // 280 ms
-    let mut pcm = Vec::with_capacity(SAMPLES * 2);
-    let mut carrier_phase = 0.0f32;
-    let mut overtone_phase = 0.0f32;
-    let mut noise_state = 0x5eed_1234u32;
-    let mut previous_noise = 0.0f32;
+    const SAMPLES: usize = 24_000; // ~540 ms
+    const HARMONICS: usize = 28;
+    const BASE_HZ: f32 = 104.0;
+    // Lightsaber-style swing: a buzzy, harmonically rich hum (two slightly
+    // detuned voices beat against each other), Doppler-shifted as the blade
+    // passes, with a moving resonance that gives the "wwwOOOwm" vowel sweep.
+    let mut pcm = Vec::with_capacity(SAMPLES * 4);
+    let mut phase = [0.0f32; 2];
+    let mut flutter_phase = 0.0f32;
+    let mut lowpass = [0.0f32; 2];
     for index in 0..SAMPLES {
-        let progress = index as f32 / SAMPLES as f32;
-        // A detuned electrical hum gets a quick Doppler-like rise and then a
-        // fall. Filtered deterministic noise supplies an airy crackle.
-        let sweep = 1.0 - (2.0 * progress - 1.0).abs();
-        let frequency = 72.0 + 190.0 * sweep + 13.0 * (progress * 31.0).sin();
-        carrier_phase += std::f32::consts::TAU * frequency / RATE as f32;
-        overtone_phase += std::f32::consts::TAU * frequency * 2.07 / RATE as f32;
-        noise_state = noise_state
-            .wrapping_mul(1_664_525)
-            .wrapping_add(1_013_904_223);
-        let white_noise = ((noise_state >> 8) as f32 / 16_777_215.0) * 2.0 - 1.0;
-        let crackle = white_noise - previous_noise * 0.86;
-        previous_noise = white_noise;
-        let attack = (progress / 0.045).min(1.0);
-        let release = ((1.0 - progress) / 0.25).min(1.0);
-        let tremolo = 0.78 + 0.22 * (progress * 48.0).sin();
-        let sample = ((carrier_phase.sin() * 0.60 + overtone_phase.sin() * 0.22 + crackle * 0.18)
-            * tremolo
-            * attack
-            * release
-            * 0.43
-            * i16::MAX as f32) as i16;
-        pcm.extend_from_slice(&sample.to_le_bytes());
+        let p = index as f32 / SAMPLES as f32;
+        // Doppler: pitch climbs while approaching, then drops quickly after.
+        let approach = (std::f32::consts::PI * p.powf(0.65)).sin().max(0.0);
+        let pitch = 0.82 + 0.78 * approach * (1.0 - 0.25 * p);
+        // Resonance sweeps up through the harmonics and back down.
+        let formant = 3.0 + 13.0 * approach;
+        // Loudest at the pass-by, with a quiet hum bed under it.
+        let envelope = (0.22 + 0.78 * approach.powf(1.4))
+            * (p / 0.02).min(1.0)
+            * ((1.0 - p) / 0.22).min(1.0);
+        flutter_phase += std::f32::consts::TAU * 118.0 / RATE as f32;
+        let flutter = 1.0 + 0.12 * flutter_phase.sin();
+        let mut frame = [0.0f32; 2];
+        for (voice, detune) in [0.9955f32, 1.0045].into_iter().enumerate() {
+            let frequency = BASE_HZ * pitch * detune;
+            phase[voice] += std::f32::consts::TAU * frequency / RATE as f32;
+            if phase[voice] > std::f32::consts::TAU {
+                phase[voice] -= std::f32::consts::TAU;
+            }
+            let mut sum = 0.0f32;
+            for n in 1..=HARMONICS {
+                let nf = n as f32;
+                if frequency * nf > 9_000.0 {
+                    break;
+                }
+                let tilt = 1.0 / nf.powf(0.75);
+                let peak = (-((nf - formant) / 3.2).powi(2)).exp();
+                sum += (phase[voice] * nf).sin() * tilt * (0.35 + 1.6 * peak);
+            }
+            // Gentle low-pass keeps the buzz from getting harsh.
+            lowpass[voice] += 0.45 * (sum - lowpass[voice]);
+            frame[voice] = lowpass[voice];
+        }
+        // Voices sit in opposite ears and bleed a little together; the pan
+        // drifts across the swing so the blade seems to move past.
+        let pan = 0.5 + 0.35 * (p * std::f32::consts::PI).cos();
+        let mid = (frame[0] + frame[1]) * 0.5;
+        let left = (mid + (frame[0] - frame[1]) * 0.5) * (1.1 - pan * 0.7);
+        let right = (mid - (frame[0] - frame[1]) * 0.5) * (0.4 + pan * 0.7);
+        for channel in [left, right] {
+            let value = (channel * flutter * envelope * 0.34).tanh() * 0.8;
+            pcm.extend_from_slice(&((value * i16::MAX as f32) as i16).to_le_bytes());
+        }
     }
     let data_len = pcm.len() as u32;
     let mut file = File::create(path)?;
@@ -531,10 +555,10 @@ fn write_swoosh_wav(path: &std::path::Path) -> io::Result<()> {
     file.write_all(b"WAVEfmt ")?;
     file.write_all(&16u32.to_le_bytes())?;
     file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&RATE.to_le_bytes())?;
-    file.write_all(&(RATE * 2).to_le_bytes())?;
     file.write_all(&2u16.to_le_bytes())?;
+    file.write_all(&RATE.to_le_bytes())?;
+    file.write_all(&(RATE * 4).to_le_bytes())?;
+    file.write_all(&4u16.to_le_bytes())?;
     file.write_all(&16u16.to_le_bytes())?;
     file.write_all(b"data")?;
     file.write_all(&data_len.to_le_bytes())?;
