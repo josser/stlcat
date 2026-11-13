@@ -6,7 +6,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::{ExtendedColorType, ImageEncoder, RgbImage};
 
 /// Render an STL as an isometric image using the Kitty graphics protocol.
 #[derive(Parser, Debug)]
@@ -116,9 +117,16 @@ fn png_for(
     orientation: Mat3,
     zoom: f32,
 ) -> Result<Vec<u8>, image::ImageError> {
+    let img = render(tris, view, width, height, orientation, zoom);
     let mut png = Vec::new();
-    DynamicImage::ImageRgb8(render(tris, view, width, height, orientation, zoom))
-        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)?;
+    // Fast compression: the flat-shaded render is cheap to compress and the
+    // encoder otherwise dominates frame time.
+    PngEncoder::new_with_quality(
+        Cursor::new(&mut png),
+        CompressionType::Fast,
+        FilterType::Sub,
+    )
+    .write_image(img.as_raw(), width, height, ExtendedColorType::Rgb8)?;
     Ok(png)
 }
 
@@ -131,98 +139,148 @@ fn render(
     zoom: f32,
 ) -> RgbImage {
     // Isometric basis: rotate around Z, then tilt down toward the XY plane.
+    // Fold it and the user orientation into one matrix so each vertex costs a
+    // single 3x3 multiply instead of repeated trig and two rotations.
     let angle = 45f32.to_radians();
     let tilt = 35.264f32.to_radians();
-    let project = |p: [f32; 3]| -> [f32; 3] {
-        let relative = [
-            p[0] - view.center[0],
-            p[1] - view.center[1],
-            p[2] - view.center[2],
-        ];
-        let x = relative[0] * angle.cos() - relative[1] * angle.sin();
-        let y = relative[0] * angle.sin() + relative[1] * angle.cos();
-        let view = [
-            x,
-            y * tilt.cos() - relative[2] * tilt.sin(),
-            y * tilt.sin() + relative[2] * tilt.cos(),
-        ];
-        transform(orientation, view)
-    };
+    let (sa, ca) = angle.sin_cos();
+    let (st, ct) = tilt.sin_cos();
+    let iso: Mat3 = [[ca, -sa, 0.0], [ct * sa, ct * ca, -st], [st * sa, st * ca, ct]];
+    let m = multiply(orientation, iso);
     // A sphere around the model has the same projected radius at every angle.
     // Unlike fitting each frame's bounds, this keeps the apparent size stable.
     let margin = 0.07;
     let scale = ((width as f32 * (1.0 - 2.0 * margin)) / (2.0 * view.radius))
         .min((height as f32 * (1.0 - 2.0 * margin)) / (2.0 * view.radius))
         * zoom;
+    let (half_w, half_h) = (width as f32 / 2.0, height as f32 / 2.0);
     let screen = |p: [f32; 3]| {
-        let q = project(p);
-        [
-            q[0] * scale + width as f32 / 2.0,
-            height as f32 / 2.0 - q[1] * scale,
-            q[2],
-        ]
+        let q = transform(
+            m,
+            [
+                p[0] - view.center[0],
+                p[1] - view.center[1],
+                p[2] - view.center[2],
+            ],
+        );
+        [q[0] * scale + half_w, half_h - q[1] * scale, q[2]]
     };
 
-    let mut img = RgbImage::from_pixel(width, height, Rgb([18, 22, 30]));
-    let mut depth = vec![f32::NEG_INFINITY; (width * height) as usize];
     let light = normalize([0.4, -0.6, 0.7]);
-    for tri in tris {
-        let p = tri.p.map(screen);
-        let n = normalize(tri.normal);
-        let shade = 0.22 + 0.78 * dot(n, light).abs();
-        let color = Rgb([
-            (45.0 * shade) as u8,
-            (167.0 * shade) as u8,
-            (235.0 * shade) as u8,
-        ]);
-        rasterize(&mut img, &mut depth, p, color);
+    // Project and shade every triangle once; the bands below then share the result.
+    let project_one = |tri: &Triangle| {
+        let shade = 0.22 + 0.78 * dot(normalize(tri.normal), light).abs();
+        ScreenTri {
+            p: tri.p.map(screen),
+            color: [
+                (45.0 * shade) as u8,
+                (167.0 * shade) as u8,
+                (235.0 * shade) as u8,
+            ],
+        }
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let parallel = threads > 1 && tris.len() >= PARALLEL_MIN_TRIANGLES;
+    let screen_tris: Vec<ScreenTri> = if parallel {
+        let mut out = vec![ScreenTri::default(); tris.len()];
+        let chunk = tris.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (src, dst) in tris.chunks(chunk).zip(out.chunks_mut(chunk)) {
+                scope.spawn(|| {
+                    for (tri, slot) in src.iter().zip(dst) {
+                        *slot = project_one(tri);
+                    }
+                });
+            }
+        });
+        out
+    } else {
+        tris.iter().map(project_one).collect()
+    };
+
+    let (w, h) = (width as usize, height as usize);
+    let mut pixels = vec![0u8; w * h * 3];
+    for px in pixels.chunks_exact_mut(3) {
+        px.copy_from_slice(&BACKGROUND);
     }
-    img
+    let mut depth = vec![f32::NEG_INFINITY; w * h];
+    if parallel {
+        // Each band owns disjoint rows, so no locking is needed.
+        let band_rows = h.div_ceil(threads * 2).max(1);
+        let screen_tris = &screen_tris;
+        std::thread::scope(|scope| {
+            for (i, (pix, dep)) in pixels
+                .chunks_mut(band_rows * w * 3)
+                .zip(depth.chunks_mut(band_rows * w))
+                .enumerate()
+            {
+                scope.spawn(move || draw_band(screen_tris, w, i * band_rows, pix, dep));
+            }
+        });
+    } else {
+        draw_band(&screen_tris, w, 0, &mut pixels, &mut depth);
+    }
+    RgbImage::from_raw(width, height, pixels).expect("buffer matches dimensions")
 }
 
-fn rasterize(img: &mut RgbImage, depth: &mut [f32], p: [[f32; 3]; 3], color: Rgb<u8>) {
+fn draw_band(tris: &[ScreenTri], w: usize, first_row: usize, pix: &mut [u8], dep: &mut [f32]) {
+    let rows = dep.len() / w;
+    for tri in tris {
+        rasterize(pix, dep, w, first_row, rows, &tri.p, tri.color);
+    }
+}
+
+const PARALLEL_MIN_TRIANGLES: usize = 20_000;
+const BACKGROUND: [u8; 3] = [18, 22, 30];
+
+#[derive(Clone, Copy, Default)]
+struct ScreenTri {
+    p: [[f32; 3]; 3],
+    color: [u8; 3],
+}
+
+/// Rasterize into one horizontal band of the image. `first_row` is the band's
+/// first image row and `rows` its height; pixels outside the band are skipped.
+fn rasterize(
+    pixels: &mut [u8],
+    depth: &mut [f32],
+    w: usize,
+    first_row: usize,
+    rows: usize,
+    p: &[[f32; 3]; 3],
+    color: [u8; 3],
+) {
+    let min_y = p[0][1].min(p[1][1]).min(p[2][1]).floor().max(first_row as f32);
+    let max_y = p[0][1]
+        .max(p[1][1])
+        .max(p[2][1])
+        .ceil()
+        .min((first_row + rows) as f32 - 1.0);
+    let min_x = p[0][0].min(p[1][0]).min(p[2][0]).floor().max(0.0);
+    let max_x = p[0][0].max(p[1][0]).max(p[2][0]).ceil().min(w as f32 - 1.0);
+    if min_x > max_x || min_y > max_y {
+        return; // outside this band or the image (also covers NaN)
+    }
     let area = edge(p[0], p[1], p[2][0], p[2][1]);
     if area.abs() < 1e-6 {
         return;
     }
-    let (w, h) = img.dimensions();
-    let lo_x = p
-        .iter()
-        .map(|v| v[0])
-        .fold(f32::INFINITY, f32::min)
-        .floor()
-        .max(0.0) as u32;
-    let hi_x = p
-        .iter()
-        .map(|v| v[0])
-        .fold(f32::NEG_INFINITY, f32::max)
-        .ceil()
-        .min(w as f32 - 1.0) as u32;
-    let lo_y = p
-        .iter()
-        .map(|v| v[1])
-        .fold(f32::INFINITY, f32::min)
-        .floor()
-        .max(0.0) as u32;
-    let hi_y = p
-        .iter()
-        .map(|v| v[1])
-        .fold(f32::NEG_INFINITY, f32::max)
-        .ceil()
-        .min(h as f32 - 1.0) as u32;
-    for y in lo_y..=hi_y {
+    let inv_area = 1.0 / area;
+    let (lo_x, hi_x) = (min_x as usize, max_x as usize);
+    for y in min_y as usize..=max_y as usize {
+        let py = y as f32 + 0.5;
+        let row = (y - first_row) * w;
         for x in lo_x..=hi_x {
             let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let a = edge(p[1], p[2], px, py) / area;
-            let b = edge(p[2], p[0], px, py) / area;
+            let a = edge(p[1], p[2], px, py) * inv_area;
+            let b = edge(p[2], p[0], px, py) * inv_area;
             let c = 1.0 - a - b;
             if a >= 0.0 && b >= 0.0 && c >= 0.0 {
                 let z = a * p[0][2] + b * p[1][2] + c * p[2][2];
-                let i = (y * w + x) as usize;
+                let i = row + x;
                 if z > depth[i] {
                     depth[i] = z;
-                    img.put_pixel(x, y, color);
+                    pixels[i * 3..i * 3 + 3].copy_from_slice(&color);
                 }
             }
         }
@@ -505,32 +563,32 @@ fn animate_kitty(
 
 fn transmit_png(png: &[u8], action: &str, cols: u32, rows: u32) -> io::Result<()> {
     let encoded = STANDARD.encode(png);
-    let mut out = io::stdout().lock();
+    // Assemble the whole escape sequence and write it once instead of issuing
+    // many small writes through stdout's line buffer.
+    let mut buf = Vec::with_capacity(encoded.len() + encoded.len() / 4096 * 16 + 64);
     // f=100 declares PNG. Kitty requires a=f to be repeated on every frame chunk.
-    for (part, chunk) in encoded.as_bytes().chunks(4096).enumerate() {
-        let more = if (part + 1) * 4096 < encoded.len() {
-            1
-        } else {
-            0
-        };
+    let chunks = encoded.as_bytes().chunks(4096);
+    let last = chunks.len().saturating_sub(1);
+    for (part, chunk) in chunks.enumerate() {
+        let more = u8::from(part != last);
         if part == 0 {
-            write!(out, "\x1b_G{},m={}", action, more)?;
+            write!(buf, "\x1b_G{action},m={more}")?;
             if cols != 0 {
-                write!(out, ",c={}", cols)?;
+                write!(buf, ",c={cols}")?;
             }
             if rows != 0 {
-                write!(out, ",r={}", rows)?;
+                write!(buf, ",r={rows}")?;
             }
-            out.write_all(b";")?;
+            buf.push(b';');
+        } else if action.starts_with("a=f,") {
+            write!(buf, "\x1b_Ga=f,m={more};")?;
         } else {
-            if action.starts_with("a=f,") {
-                write!(out, "\x1b_Ga=f,m={};", more)?;
-            } else {
-                write!(out, "\x1b_Gm={};", more)?;
-            }
+            write!(buf, "\x1b_Gm={more};")?;
         }
-        out.write_all(chunk)?;
-        out.write_all(b"\x1b\\")?;
+        buf.extend_from_slice(chunk);
+        buf.extend_from_slice(b"\x1b\\");
     }
+    let mut out = io::stdout().lock();
+    out.write_all(&buf)?;
     out.flush()
 }
